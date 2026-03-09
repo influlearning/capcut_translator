@@ -1,20 +1,28 @@
 /**
  * CapCut draft_info.json 파싱/수정 모듈
  *
- * 자막 구조:
- * - 각 자막은 2줄: 영어(노란색) + 번역(흰색)
- * - content.text = "English line\n번역 라인"
- * - content.styles[0] = 영어 부분 (노란색)
- * - content.styles[1] = 번역 부분 (흰색)
- * - 타이틀은 별도 텍스트 요소 (번역만 있거나 구조가 다를 수 있음)
+ * 자막 구조 (실제 CapCut 프로젝트 기반):
+ * - KR 프로젝트: 3개 텍스트 트랙 (영어 자막 / 한국어 번역 / 타이틀)
+ *   → 영어와 한국어가 별도 트랙, 같은 시간대에 매칭
+ * - EN 프로젝트: 1개 텍스트 트랙 (영어 자막만)
+ * - 영어 텍스트 내 \n은 줄바꿈(리치텍스트), 이중언어 구분자가 아님
  */
 
 import { logger, CATEGORIES } from './logger.js';
 
+// ─────────────────────────────────────────────
+// parseProject
+// ─────────────────────────────────────────────
+
 /**
  * draft_info.json을 파싱하여 자막 정보 추출
+ *
+ * 1. 모든 텍스트 트랙(type='text') 수집
+ * 2. 각 트랙을 분류: 영어 / 번역 / 타이틀
+ * 3. 트랙 1개면 EN-only, 여러 개면 시간 매칭으로 영어-번역 페어링
+ *
  * @param {object} draftInfo - 파싱된 draft_info.json 객체
- * @returns {{ subtitles: Array, title: object|null, metadata: object }}
+ * @returns {{ subtitles: Array, title: object|null, isEnglishOnly: boolean, metadata: object }}
  */
 export function parseProject(draftInfo) {
   logger.info(CATEGORIES.PARSE, '프로젝트 파싱 시작', {
@@ -25,58 +33,43 @@ export function parseProject(draftInfo) {
 
   const texts = draftInfo.materials?.texts || [];
   const tracks = draftInfo.tracks || [];
+  const videoDuration = draftInfo.duration || 0;
 
-  // 텍스트 트랙 찾기
-  const textTrack = tracks.find(t => t.type === 'text');
-  if (!textTrack) {
+  // 텍스트 트랙만 필터
+  const textTracks = tracks.filter(t => t.type === 'text');
+  if (textTracks.length === 0) {
     logger.warn(CATEGORIES.PARSE, '텍스트 트랙을 찾을 수 없습니다');
-    return { subtitles: [], title: null, metadata: {} };
+    return { subtitles: [], title: null, isEnglishOnly: true, metadata: {} };
   }
 
-  // 세그먼트를 시간순 정렬
-  const segments = [...textTrack.segments].sort(
-    (a, b) => a.target_timerange.start - b.target_timerange.start
-  );
+  logger.info(CATEGORIES.PARSE, `텍스트 트랙 ${textTracks.length}개, 텍스트 material ${texts.length}개 발견`);
 
-  logger.info(CATEGORIES.PARSE, `텍스트 ${texts.length}개, 세그먼트 ${segments.length}개 발견`);
+  // ── 트랙 분류 ──
+  const classified = classifyTracks(textTracks, texts, videoDuration);
 
-  // 각 세그먼트에 대응하는 텍스트 매핑
-  const subtitles = [];
-  let title = null;
+  // ── 자막 빌드 ──
+  const isEnglishOnly = !classified.translationTrack;
+  let subtitles;
 
-  for (const seg of segments) {
-    const text = texts.find(t => t.id === seg.material_id);
-    if (!text) {
-      logger.warn(CATEGORIES.PARSE, `세그먼트 material_id에 대응하는 텍스트 없음: ${seg.material_id}`);
-      continue;
-    }
-
-    const parsed = parseTextContent(text);
-    parsed.segmentId = seg.id;
-    parsed.materialId = seg.material_id;
-    parsed.timeRange = seg.target_timerange;
-
-    // 타이틀 vs 자막 판별
-    // 타이틀 특징: 영어 부분이 없거나, 시간이 전체 영상 길이에 가까움
-    if (!parsed.englishLine && parsed.translationLine) {
-      // 영어 없이 번역만 있으면 타이틀일 가능성 높음
-      title = parsed;
-      logger.info(CATEGORIES.PARSE, `타이틀 감지: "${parsed.fullText.slice(0, 50)}..."`, {
-        timeRange: seg.target_timerange,
-      });
-    } else {
-      subtitles.push(parsed);
-    }
+  if (isEnglishOnly) {
+    // EN-only: 영어 트랙의 세그먼트만
+    subtitles = buildEnglishOnlySubtitles(classified.englishTrack, texts);
+  } else {
+    // KR 등 다국어: 영어 + 번역 트랙을 시간으로 매칭
+    subtitles = buildPairedSubtitles(classified.englishTrack, classified.translationTrack, texts);
   }
 
-  // 타이틀이 못 찾아졌으면 첫 번째 세그먼트를 타이틀로 추정하는 로직은 건너뜀
-  // (실제 프로젝트에서 확인 후 조정)
+  // ── 타이틀 빌드 ──
+  const title = classified.titleTrack
+    ? buildTitle(classified.titleTrack, texts)
+    : null;
 
-  logger.info(CATEGORIES.PARSE, `파싱 완료: 타이틀 ${title ? 1 : 0}개, 자막 ${subtitles.length}개`);
+  logger.info(CATEGORIES.PARSE, `파싱 완료: 자막 ${subtitles.length}개, 타이틀 ${title ? 1 : 0}개, EN-only: ${isEnglishOnly}`);
 
   return {
     subtitles,
     title,
+    isEnglishOnly,
     metadata: {
       version: draftInfo.new_version,
       duration: draftInfo.duration,
@@ -85,71 +78,298 @@ export function parseProject(draftInfo) {
   };
 }
 
+// ─────────────────────────────────────────────
+// 트랙 분류
+// ─────────────────────────────────────────────
+
 /**
- * 텍스트 material에서 영어/번역 부분 분리
- * @param {object} textMaterial - materials.texts[] 항목
+ * 텍스트 트랙을 영어/번역/타이틀로 분류
+ *
+ * 판별 기준:
+ * - 세그먼트 1개 + 전체 영상 길이의 80% 이상 + 비영어 → 타이틀
+ * - 샘플 텍스트가 영어 위주 → 영어 트랙
+ * - 나머지 다중 세그먼트 비영어 → 번역 트랙
  */
-function parseTextContent(textMaterial) {
-  const contentStr = textMaterial.content || '{}';
+function classifyTracks(textTracks, texts, videoDuration) {
+  let englishTrack = null;
+  let translationTrack = null;
+  let titleTrack = null;
+
+  for (const track of textTracks) {
+    const segments = track.segments || [];
+    if (segments.length === 0) continue;
+
+    // 타이틀 판별: 세그먼트 1개 + 영상 길이 80% 이상 + 비영어
+    if (segments.length === 1 && videoDuration > 0) {
+      const seg = segments[0];
+      const segDuration = seg.target_timerange?.duration || 0;
+      const ratio = segDuration / videoDuration;
+      const material = texts.find(t => t.id === seg.material_id);
+      const sampleText = extractTextFromMaterial(material);
+
+      if (ratio >= 0.8 && !isPrimarilyEnglish(sampleText)) {
+        titleTrack = track;
+        logger.info(CATEGORIES.PARSE, `타이틀 트랙 감지 (비율: ${(ratio * 100).toFixed(0)}%)`, {
+          text: sampleText.slice(0, 60),
+        });
+        continue;
+      }
+    }
+
+    // 영어/번역 판별: 처음 몇 개 세그먼트 샘플링
+    const sampleTexts = sampleTrackTexts(track, texts, 3);
+    const isEnglish = sampleTexts.length > 0 && sampleTexts.every(t => isPrimarilyEnglish(t));
+
+    if (isEnglish) {
+      englishTrack = track;
+      logger.info(CATEGORIES.PARSE, `영어 트랙 감지 (세그먼트 ${segments.length}개)`);
+    } else {
+      // 다중 세그먼트 비영어 → 번역 트랙
+      if (segments.length > 1) {
+        translationTrack = track;
+        logger.info(CATEGORIES.PARSE, `번역 트랙 감지 (세그먼트 ${segments.length}개)`);
+      } else if (!titleTrack) {
+        // 세그먼트 1개인데 타이틀 조건 안 맞으면 번역으로
+        translationTrack = track;
+        logger.info(CATEGORIES.PARSE, '번역 트랙 감지 (세그먼트 1개, 타이틀 아님)');
+      }
+    }
+  }
+
+  // 영어 트랙이 없지만 트랙이 1개면 그것이 영어 트랙 (EN-only)
+  if (!englishTrack && textTracks.length === 1 && !titleTrack) {
+    englishTrack = textTracks[0];
+    logger.info(CATEGORIES.PARSE, '텍스트 트랙 1개 → EN-only로 처리');
+  }
+
+  return { englishTrack, translationTrack, titleTrack };
+}
+
+/**
+ * 트랙에서 처음 N개 세그먼트의 텍스트 샘플 추출
+ */
+function sampleTrackTexts(track, texts, count) {
+  const segments = (track.segments || []).slice(0, count);
+  const result = [];
+  for (const seg of segments) {
+    const material = texts.find(t => t.id === seg.material_id);
+    const text = extractTextFromMaterial(material);
+    if (text) result.push(text);
+  }
+  return result;
+}
+
+/**
+ * material에서 텍스트 추출 (content JSON 파싱)
+ */
+function extractTextFromMaterial(material) {
+  if (!material) return '';
+  try {
+    const content = JSON.parse(material.content || '{}');
+    return content.text || '';
+  } catch {
+    return '';
+  }
+}
+
+// ─────────────────────────────────────────────
+// 자막 빌드
+// ─────────────────────────────────────────────
+
+/**
+ * EN-only: 영어 트랙만으로 자막 배열 생성
+ * → translationLine 비워둠, materialId = englishMaterialId
+ */
+function buildEnglishOnlySubtitles(englishTrack, texts) {
+  if (!englishTrack) return [];
+
+  const segments = sortSegmentsByTime(englishTrack.segments || []);
+  const subtitles = [];
+
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const material = texts.find(t => t.id === seg.material_id);
+    if (!material) {
+      logger.warn(CATEGORIES.PARSE, `영어 세그먼트의 material 없음: ${seg.material_id}`);
+      continue;
+    }
+
+    const parsed = parseMaterialContent(material);
+
+    subtitles.push({
+      index: subtitles.length,
+      englishLine: flattenNewlines(parsed.text),
+      translationLine: '',
+      englishMaterialId: material.id,
+      translationMaterialId: null,
+      materialId: material.id, // EN-only → 영어 material을 수정 대상으로
+      segmentId: seg.id,
+      timeRange: seg.target_timerange,
+      rawMaterial: material,
+      rawEnglishMaterial: material,
+      content: parsed.content,
+      styles: parsed.styles,
+      words: parsed.words,
+    });
+  }
+
+  return subtitles;
+}
+
+/**
+ * 다국어: 영어+번역 트랙을 시간으로 매칭하여 페어링
+ * → materialId = translationMaterialId (번역 material을 수정 대상)
+ */
+function buildPairedSubtitles(englishTrack, translationTrack, texts) {
+  if (!englishTrack || !translationTrack) return [];
+
+  const enSegments = sortSegmentsByTime(englishTrack.segments || []);
+  const trSegments = sortSegmentsByTime(translationTrack.segments || []);
+
+  const subtitles = [];
+
+  for (const enSeg of enSegments) {
+    const enMaterial = texts.find(t => t.id === enSeg.material_id);
+    if (!enMaterial) continue;
+
+    // 시간 매칭: 시작 시간이 100ms(100000μs) 이내인 번역 세그먼트 찾기
+    const TIME_TOLERANCE = 100000; // 100ms in microseconds
+    const enStart = enSeg.target_timerange?.start || 0;
+    const matchedTrSeg = trSegments.find(trSeg => {
+      const trStart = trSeg.target_timerange?.start || 0;
+      return Math.abs(enStart - trStart) <= TIME_TOLERANCE;
+    });
+
+    const trMaterial = matchedTrSeg
+      ? texts.find(t => t.id === matchedTrSeg.material_id)
+      : null;
+
+    const enParsed = parseMaterialContent(enMaterial);
+    const trParsed = trMaterial ? parseMaterialContent(trMaterial) : null;
+
+    // 번역 material이 수정 대상
+    const targetMaterial = trMaterial || enMaterial;
+    const targetParsed = trParsed || enParsed;
+
+    subtitles.push({
+      index: subtitles.length,
+      englishLine: flattenNewlines(enParsed.text),
+      translationLine: trParsed ? trParsed.text : '',
+      englishMaterialId: enMaterial.id,
+      translationMaterialId: trMaterial ? trMaterial.id : null,
+      materialId: targetMaterial.id,
+      segmentId: matchedTrSeg ? matchedTrSeg.id : enSeg.id,
+      timeRange: enSeg.target_timerange,
+      rawMaterial: targetMaterial,
+      rawEnglishMaterial: enMaterial,
+      content: targetParsed.content,
+      styles: targetParsed.styles,
+      words: targetParsed.words,
+    });
+
+    if (!matchedTrSeg) {
+      logger.warn(CATEGORIES.PARSE, `영어 세그먼트에 매칭되는 번역 없음 (start: ${enStart})`, {
+        englishText: enParsed.text.slice(0, 40),
+      });
+    }
+  }
+
+  return subtitles;
+}
+
+/**
+ * 타이틀 트랙에서 타이틀 객체 빌드
+ */
+function buildTitle(titleTrack, texts) {
+  const seg = (titleTrack.segments || [])[0];
+  if (!seg) return null;
+
+  const material = texts.find(t => t.id === seg.material_id);
+  if (!material) return null;
+
+  const parsed = parseMaterialContent(material);
+
+  return {
+    materialId: material.id,
+    fullText: parsed.text,
+    englishLine: '',          // 타이틀은 비영어이므로 빈 문자열
+    translationLine: parsed.text,
+    rawMaterial: material,
+    content: parsed.content,
+    styles: parsed.styles,
+    words: parsed.words,
+    segmentId: seg.id,
+    timeRange: seg.target_timerange,
+  };
+}
+
+// ─────────────────────────────────────────────
+// material 파싱 헬퍼
+// ─────────────────────────────────────────────
+
+/**
+ * material의 content JSON 파싱 + words 파싱
+ * @returns {{ text, content, styles, words }}
+ */
+function parseMaterialContent(material) {
   let content;
   try {
-    content = JSON.parse(contentStr);
+    content = JSON.parse(material.content || '{}');
   } catch (e) {
     logger.error(CATEGORIES.PARSE, `content JSON 파싱 실패: ${e.message}`, {
-      id: textMaterial.id,
-      content: contentStr.slice(0, 200),
+      id: material.id,
     });
     content = { text: '', styles: [] };
   }
 
-  const fullText = content.text || '';
-  const styles = content.styles || [];
-
-  // 영어/번역 분리: \n + 2스타일이면 bilingual, 아니면 단일 언어 블록
-  const newlineIndex = fullText.indexOf('\n');
-  let englishLine = '';
-  let translationLine = '';
-
-  if (newlineIndex >= 0 && styles.length >= 2) {
-    // 2줄 bilingual 구조: 영어 + 번역 (한국어/중국어/일본어 프로젝트)
-    englishLine = fullText.slice(0, newlineIndex);
-    translationLine = fullText.slice(newlineIndex + 1);
-  } else if (isPrimarilyEnglish(fullText)) {
-    // 영어 전용 자막 (리치텍스트 스타일 여러 개일 수 있음)
-    englishLine = fullText;
-  } else {
-    // 비영어 단일 블록 — 타이틀이거나 번역 전용
-    translationLine = fullText;
-  }
-
-  // words 파싱
   let words = { start_time: [], end_time: [], text: [] };
-  if (textMaterial.words) {
+  if (material.words) {
     try {
-      words = typeof textMaterial.words === 'string'
-        ? JSON.parse(textMaterial.words)
-        : textMaterial.words;
+      words = typeof material.words === 'string'
+        ? JSON.parse(material.words)
+        : material.words;
     } catch {
       // words 파싱 실패 시 빈 값 유지
     }
   }
 
   return {
-    id: textMaterial.id,
-    fullText,
-    englishLine: englishLine.trim(),
-    translationLine: translationLine.trim(),
-    content,       // 파싱된 content 객체
-    styles,        // content.styles 배열
+    text: content.text || '',
+    content,
+    styles: content.styles || [],
     words,
-    rawMaterial: textMaterial, // 원본 material (모든 필드 보존)
   };
 }
 
 /**
+ * 세그먼트를 시간순 정렬
+ */
+function sortSegmentsByTime(segments) {
+  return [...segments].sort(
+    (a, b) => (a.target_timerange?.start || 0) - (b.target_timerange?.start || 0)
+  );
+}
+
+/**
+ * 텍스트 내 \n을 공백으로 변환 (영어 줄바꿈 평탄화)
+ */
+function flattenNewlines(text) {
+  return (text || '').replace(/\n/g, ' ').trim();
+}
+
+// ─────────────────────────────────────────────
+// applyReplacements
+// ─────────────────────────────────────────────
+
+/**
  * 자막의 번역 부분을 새 텍스트로 교체
+ *
+ * 각 replacement에 isEnglishOnly 플래그가 있음:
+ * - false (KR 프로젝트): content.text 전체를 newTranslation으로 교체
+ * - true (EN 프로젝트): 기존 영어 유지 + \n\n + newTranslation 추가
+ *
  * @param {object} draftInfo - 원본 draft_info.json (깊은 복사해서 수정)
- * @param {Array} replacements - [{ materialId, newTranslation, fontConfig, styleConfig }]
+ * @param {Array} replacements - [{ materialId, newTranslation, isEnglishOnly, fontConfig, styleConfig }]
  * @returns {object} 수정된 draft_info.json
  */
 export function applyReplacements(draftInfo, replacements) {
@@ -174,6 +394,7 @@ export function applyReplacements(draftInfo, replacements) {
       successCount++;
       logger.info(CATEGORIES.CONVERT, `자막 교체 완료: "${rep.newTranslation.slice(0, 30)}..."`, {
         materialId: rep.materialId,
+        isEnglishOnly: rep.isEnglishOnly,
       });
     } catch (e) {
       logger.error(CATEGORIES.CONVERT, `자막 교체 실패: ${e.message}`, {
@@ -183,18 +404,34 @@ export function applyReplacements(draftInfo, replacements) {
     }
   }
 
-  // subtitle_taskinfo 업데이트 (선택적)
+  // subtitle_taskinfo 업데이트
   updateSubtitleTaskinfo(modified, replacements);
 
   logger.info(CATEGORIES.CONVERT, `변환 완료: 성공 ${successCount}, 실패 ${errorCount}`);
   return modified;
 }
 
+// ─────────────────────────────────────────────
+// replaceTextMaterial
+// ─────────────────────────────────────────────
+
 /**
  * 개별 텍스트 material 교체
+ *
+ * KR 프로젝트 (isEnglishOnly=false):
+ *   - content.text를 newTranslation으로 전체 교체
+ *   - 스타일 1개로 통일 [0, newTranslation.length]
+ *
+ * EN 프로젝트 (isEnglishOnly=true):
+ *   - 기존 영어 텍스트 + \n\n + newTranslation
+ *   - 기존 영어 스타일 유지, 번역용 새 스타일 추가
+ *
+ * 타이틀 (isTitle=true):
+ *   - " / " 포함 시 2줄로 분리 (line1\nline2, 2 스타일)
+ *   - 아니면 단일 스타일
  */
 function replaceTextMaterial(textMaterial, replacement) {
-  const { newTranslation, fontConfig, styleConfig } = replacement;
+  const { newTranslation, isEnglishOnly, isTitle, fontConfig, styleConfig } = replacement;
 
   // content 파싱
   let content;
@@ -206,47 +443,67 @@ function replaceTextMaterial(textMaterial, replacement) {
 
   const oldText = content.text || '';
   const styles = content.styles || [];
-  const newlineIndex = oldText.indexOf('\n');
 
   let newText;
-  let englishEnd; // 영어 부분 끝 인덱스
+  let englishEnd = 0;
 
-  if (newlineIndex >= 0 && styles.length >= 2) {
-    // 확실한 bilingual 2줄 구조: 영어\n번역 → 영어\n새번역
-    const englishPart = oldText.slice(0, newlineIndex);
-    newText = englishPart + '\n' + newTranslation;
-    englishEnd = englishPart.length;
+  if (isTitle) {
+    // ── 타이틀 교체 ──
+    if (newTranslation.includes(' / ')) {
+      // " / "로 분리 → 2줄 + 2스타일
+      const [line1, line2] = newTranslation.split(' / ', 2);
+      newText = line1 + '\n' + line2;
 
-    // 영어(styles[0]) + 번역(styles[1]) range 재계산
-    styles[0].range = [0, englishEnd];
-    styles[1].range = [englishEnd + 1, newText.length];
-    if (fontConfig) applyFontToStyle(styles[1], fontConfig);
-    if (styleConfig) applyStyleConfig(styles[1], styleConfig);
-    content.styles = styles.slice(0, 2);
+      // 스타일 2개: line1용, line2용
+      const style1 = styles[0] ? JSON.parse(JSON.stringify(styles[0])) : {};
+      const style2 = styles[1] ? JSON.parse(JSON.stringify(styles[1])) : JSON.parse(JSON.stringify(style1));
+      style1.range = [0, line1.length];
+      style2.range = [line1.length + 1, newText.length];
 
-  } else if (isPrimarilyEnglish(oldText)) {
-    // 영어 전용 — 영어 유지 + \n\n + 번역 추가
+      if (fontConfig) {
+        applyFontToStyle(style1, fontConfig);
+        applyFontToStyle(style2, fontConfig);
+      }
+      if (styleConfig) {
+        applyStyleConfig(style1, styleConfig);
+        applyStyleConfig(style2, styleConfig);
+      }
+      content.styles = [style1, style2];
+    } else {
+      // 단일 텍스트 → 1스타일
+      newText = newTranslation;
+      const style = styles[0] ? JSON.parse(JSON.stringify(styles[0])) : {};
+      style.range = [0, newText.length];
+      if (fontConfig) applyFontToStyle(style, fontConfig);
+      if (styleConfig) applyStyleConfig(style, styleConfig);
+      content.styles = [style];
+    }
+
+  } else if (isEnglishOnly) {
+    // ── EN 프로젝트: 영어 유지 + 번역 추가 ──
     newText = oldText + '\n\n' + newTranslation;
     englishEnd = oldText.length;
 
-    // 기존 영어 스타일은 모두 유지 (range 변경 없음 — 영어 텍스트 동일)
-    // 번역용 새 스타일 생성 (마지막 스타일 기반 복사)
-    const baseStyle = styles[styles.length - 1] || {};
-    const translationStyle = JSON.parse(JSON.stringify(baseStyle));
-    translationStyle.range = [englishEnd + 2, newText.length]; // \n\n 이후
-    if (fontConfig) applyFontToStyle(translationStyle, fontConfig);
-    if (styleConfig) applyStyleConfig(translationStyle, styleConfig);
-    content.styles = [...styles, translationStyle];
+    // 기존 영어 스타일 모두 유지 (range 변경 없음)
+    // 번역용 새 스타일 추가 (마지막 스타일 기반 복사)
+    const baseStyle = styles.length > 0
+      ? JSON.parse(JSON.stringify(styles[styles.length - 1]))
+      : {};
+    baseStyle.range = [englishEnd + 2, newText.length]; // \n\n 이후
+    if (fontConfig) applyFontToStyle(baseStyle, fontConfig);
+    if (styleConfig) applyStyleConfig(baseStyle, styleConfig);
+    content.styles = [...styles, baseStyle];
 
   } else {
-    // 비영어 (타이틀 등) — 전체 교체
+    // ── KR 프로젝트: 전체 교체 ──
     newText = newTranslation;
-    englishEnd = 0;
-    if (styles.length >= 1) {
-      styles[0].range = [0, newText.length];
-      if (fontConfig) applyFontToStyle(styles[0], fontConfig);
-      if (styleConfig) applyStyleConfig(styles[0], styleConfig);
-    }
+
+    // 단일 스타일로 통일
+    const style = styles[0] ? JSON.parse(JSON.stringify(styles[0])) : {};
+    style.range = [0, newText.length];
+    if (fontConfig) applyFontToStyle(style, fontConfig);
+    if (styleConfig) applyStyleConfig(style, styleConfig);
+    content.styles = [style];
   }
 
   // content 업데이트
@@ -284,6 +541,10 @@ function replaceTextMaterial(textMaterial, replacement) {
   updateWordTimings(textMaterial, newTranslation, englishEnd);
 }
 
+// ─────────────────────────────────────────────
+// 스타일/폰트 헬퍼 (기존 유지)
+// ─────────────────────────────────────────────
+
 /**
  * content.styles[]에 폰트 적용
  */
@@ -311,8 +572,12 @@ function applyStyleConfig(style, styleConfig) {
   }
 }
 
+// ─────────────────────────────────────────────
+// words 타이밍 (기존 유지)
+// ─────────────────────────────────────────────
+
 /**
- * 단어별 타이밍 재계산 (번역 부분만)
+ * 단어별 타이밍 재계산
  * 원본 타이밍의 전체 시간 범위를 새 단어/글자로 비례 분배
  */
 function updateWordTimings(textMaterial, newTranslation, englishEnd) {
@@ -338,12 +603,12 @@ function updateWordTimings(textMaterial, newTranslation, englishEnd) {
 
   if (totalDuration <= 0) return;
 
-  // 새 텍스트의 전체 내용 (영어 + 번역)
+  // 새 텍스트의 전체 내용 (영어 + 번역 포함 시 content에서 가져옴)
   const fullText = englishEnd > 0
-    ? textMaterial.content ? JSON.parse(textMaterial.content).text : newTranslation
+    ? (() => { try { return JSON.parse(textMaterial.content).text; } catch { return newTranslation; } })()
     : newTranslation;
 
-  // 글자 단위로 분리 (CJK: 글자 단위, 영어/한국어: 단어 단위)
+  // 단어 단위로 분리
   const newWords = splitIntoWords(fullText);
 
   // 비례 분배
@@ -462,6 +727,10 @@ function getCharType(char) {
 
   return 'other';
 }
+
+// ─────────────────────────────────────────────
+// 유틸리티
+// ─────────────────────────────────────────────
 
 /**
  * subtitle_taskinfo 텍스트 업데이트

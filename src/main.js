@@ -120,6 +120,7 @@ function renderStep1() {
         <div class="summary-row"><span>프로젝트명</span><span>${state.projectData.projectName}</span></div>
         <div class="summary-row"><span>자막 수</span><span>${state.parsedProject.subtitles.length}개</span></div>
         <div class="summary-row"><span>타이틀</span><span>${state.parsedProject.title ? '있음' : '없음'}</span></div>
+        <div class="summary-row"><span>프로젝트 유형</span><span>${state.parsedProject.isEnglishOnly ? '영어 전용' : '영어 + 번역'}</span></div>
         <div class="summary-row"><span>총 길이</span><span>${(state.parsedProject.metadata.duration / 1000000).toFixed(1)}초</span></div>
        </div>`
     : '';
@@ -635,6 +636,8 @@ async function startConversion() {
           newTranslation: r.sheetTarget,
           fontConfig,
           styleConfig,
+          isEnglishOnly: state.parsedProject.isEnglishOnly,
+          isTitle: r.type === 'title',
         }));
 
       logger.info(CATEGORIES.CONVERT, `${langLabel}: ${replacements.length}건 교체`);
