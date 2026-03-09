@@ -224,8 +224,12 @@ function replaceTextMaterial(textMaterial, replacement) {
     const englishPart = oldText.slice(styles[0].range[0], styles[0].range[1]);
     newText = englishPart + '\n' + newTranslation;
     englishEnd = englishPart.length;
+  } else if (styles.length === 1 && oldText && newTranslation !== oldText) {
+    // 영어 단일 요소 — 아래에 줄바꿈 2번 + 번역 추가
+    newText = oldText + '\n\n' + newTranslation;
+    englishEnd = oldText.length;
   } else {
-    // 단일 요소 (타이틀 등) — 전체 교체
+    // 타이틀 등 — 전체 교체
     newText = newTranslation;
     englishEnd = 0;
   }
@@ -248,8 +252,25 @@ function replaceTextMaterial(textMaterial, replacement) {
 
     // 추가 스타일이 있으면 제거 (2개만 유지)
     content.styles = styles.slice(0, 2);
+  } else if (styles.length === 1 && englishEnd > 0) {
+    // 영어 단일 요소 + 번역 추가 — 스타일 2개로 확장
+    styles[0].range = [0, englishEnd];
+
+    // 번역용 새 스타일 생성 (기존 스타일 복사 후 폰트/색상만 변경)
+    const translationStyle = JSON.parse(JSON.stringify(styles[0]));
+    // \n\n 다음부터 (englishEnd + 2)
+    translationStyle.range = [englishEnd + 2, newText.length];
+
+    if (fontConfig) {
+      applyFontToStyle(translationStyle, fontConfig);
+    }
+    if (styleConfig) {
+      applyStyleConfig(translationStyle, styleConfig);
+    }
+
+    content.styles = [styles[0], translationStyle];
   } else if (styles.length === 1) {
-    // 단일 스타일 — 전체 교체
+    // 타이틀 등 — 전체 교체
     styles[0].range = [0, newText.length];
     if (fontConfig) {
       applyFontToStyle(styles[0], fontConfig);
