@@ -105,23 +105,20 @@ function parseTextContent(textMaterial) {
   const fullText = content.text || '';
   const styles = content.styles || [];
 
-  // 영어/번역 분리: \n으로 나뉘는지 확인
+  // 영어/번역 분리: \n + 2스타일이면 bilingual, 아니면 단일 언어 블록
   const newlineIndex = fullText.indexOf('\n');
   let englishLine = '';
   let translationLine = '';
 
   if (newlineIndex >= 0 && styles.length >= 2) {
-    // 2줄 구조: 영어 + 번역
+    // 2줄 bilingual 구조: 영어 + 번역 (한국어/중국어/일본어 프로젝트)
     englishLine = fullText.slice(0, newlineIndex);
     translationLine = fullText.slice(newlineIndex + 1);
-  } else if (styles.length >= 2) {
-    // \n 없이 스타일 범위로 구분되는 경우
-    const firstRange = styles[0].range;
-    const secondRange = styles[1].range;
-    englishLine = fullText.slice(firstRange[0], firstRange[1]);
-    translationLine = fullText.slice(secondRange[0], secondRange[1]);
+  } else if (isPrimarilyEnglish(fullText)) {
+    // 영어 전용 자막 (리치텍스트 스타일 여러 개일 수 있음)
+    englishLine = fullText;
   } else {
-    // 단일 스타일 — 타이틀이거나 단일 언어 자막
+    // 비영어 단일 블록 — 타이틀이거나 번역 전용
     translationLine = fullText;
   }
 
@@ -214,69 +211,41 @@ function replaceTextMaterial(textMaterial, replacement) {
   let newText;
   let englishEnd; // 영어 부분 끝 인덱스
 
-  if (newlineIndex >= 0) {
-    // 2줄 구조: 영어\n번역 → 영어\n새번역
+  if (newlineIndex >= 0 && styles.length >= 2) {
+    // 확실한 bilingual 2줄 구조: 영어\n번역 → 영어\n새번역
     const englishPart = oldText.slice(0, newlineIndex);
     newText = englishPart + '\n' + newTranslation;
     englishEnd = englishPart.length;
-  } else if (styles.length >= 2) {
-    // 스타일 범위로 구분
-    const englishPart = oldText.slice(styles[0].range[0], styles[0].range[1]);
-    newText = englishPart + '\n' + newTranslation;
-    englishEnd = englishPart.length;
-  } else if (styles.length === 1 && oldText && newTranslation !== oldText) {
-    // 영어 단일 요소 — 아래에 줄바꿈 2번 + 번역 추가
+
+    // 영어(styles[0]) + 번역(styles[1]) range 재계산
+    styles[0].range = [0, englishEnd];
+    styles[1].range = [englishEnd + 1, newText.length];
+    if (fontConfig) applyFontToStyle(styles[1], fontConfig);
+    if (styleConfig) applyStyleConfig(styles[1], styleConfig);
+    content.styles = styles.slice(0, 2);
+
+  } else if (isPrimarilyEnglish(oldText)) {
+    // 영어 전용 — 영어 유지 + \n\n + 번역 추가
     newText = oldText + '\n\n' + newTranslation;
     englishEnd = oldText.length;
+
+    // 기존 영어 스타일은 모두 유지 (range 변경 없음 — 영어 텍스트 동일)
+    // 번역용 새 스타일 생성 (마지막 스타일 기반 복사)
+    const baseStyle = styles[styles.length - 1] || {};
+    const translationStyle = JSON.parse(JSON.stringify(baseStyle));
+    translationStyle.range = [englishEnd + 2, newText.length]; // \n\n 이후
+    if (fontConfig) applyFontToStyle(translationStyle, fontConfig);
+    if (styleConfig) applyStyleConfig(translationStyle, styleConfig);
+    content.styles = [...styles, translationStyle];
+
   } else {
-    // 타이틀 등 — 전체 교체
+    // 비영어 (타이틀 등) — 전체 교체
     newText = newTranslation;
     englishEnd = 0;
-  }
-
-  // 스타일 range 재계산
-  if (styles.length >= 2 && englishEnd > 0) {
-    // 영어 스타일: [0, englishEnd]
-    styles[0].range = [0, englishEnd];
-
-    // 번역 스타일: [englishEnd + 1, newText.length] (\n 다음부터)
-    styles[1].range = [englishEnd + 1, newText.length];
-
-    // 폰트/스타일 교체 (번역 부분만)
-    if (fontConfig) {
-      applyFontToStyle(styles[1], fontConfig);
-    }
-    if (styleConfig) {
-      applyStyleConfig(styles[1], styleConfig);
-    }
-
-    // 추가 스타일이 있으면 제거 (2개만 유지)
-    content.styles = styles.slice(0, 2);
-  } else if (styles.length === 1 && englishEnd > 0) {
-    // 영어 단일 요소 + 번역 추가 — 스타일 2개로 확장
-    styles[0].range = [0, englishEnd];
-
-    // 번역용 새 스타일 생성 (기존 스타일 복사 후 폰트/색상만 변경)
-    const translationStyle = JSON.parse(JSON.stringify(styles[0]));
-    // \n\n 다음부터 (englishEnd + 2)
-    translationStyle.range = [englishEnd + 2, newText.length];
-
-    if (fontConfig) {
-      applyFontToStyle(translationStyle, fontConfig);
-    }
-    if (styleConfig) {
-      applyStyleConfig(translationStyle, styleConfig);
-    }
-
-    content.styles = [styles[0], translationStyle];
-  } else if (styles.length === 1) {
-    // 타이틀 등 — 전체 교체
-    styles[0].range = [0, newText.length];
-    if (fontConfig) {
-      applyFontToStyle(styles[0], fontConfig);
-    }
-    if (styleConfig) {
-      applyStyleConfig(styles[0], styleConfig);
+    if (styles.length >= 1) {
+      styles[0].range = [0, newText.length];
+      if (fontConfig) applyFontToStyle(styles[0], fontConfig);
+      if (styleConfig) applyStyleConfig(styles[0], styleConfig);
     }
   }
 
@@ -455,6 +424,18 @@ function splitIntoWords(text) {
 
   if (buffer) result.push(buffer);
   return result;
+}
+
+/**
+ * 텍스트가 주로 영어(라틴 문자)인지 판별
+ * 영문자+숫자+기본 구두점 비율이 50% 이상이면 영어로 판정
+ */
+function isPrimarilyEnglish(text) {
+  if (!text) return false;
+  const nonSpace = text.replace(/\s/g, '');
+  if (nonSpace.length === 0) return false;
+  const asciiChars = nonSpace.replace(/[^a-zA-Z0-9.,!?;:'"()\-]/g, '').length;
+  return asciiChars / nonSpace.length > 0.5;
 }
 
 /**
