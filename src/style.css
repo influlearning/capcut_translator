@@ -310,5 +310,53 @@ body {
   transition: width 0.3s;
 }
 
+/* 토글 그룹 */
+.toggle-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.toggle-group input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+.toggle-group > label {
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  color: var(--text);
+}
+.toggle-group.master-toggle > label {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+/* disabled 입력 필드 */
+.input-group input:disabled,
+.input-group select:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  background: var(--bg);
+}
+
+/* 스타일 섹션 구분 */
+.style-section {
+  margin-bottom: 16px;
+  padding: 12px;
+  background: var(--surface);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+.style-section h4 {
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
 /* 로그 패널이 있을 때 하단 여백 */
 body { padding-bottom: 48px; }

@@ -18,6 +18,9 @@ export const STORAGE_KEYS = {
   SHEET_URL: 'capcut_translator_sheet_url',
   FONT_SETTINGS: 'capcut_translator_font_settings',
   STYLE_SETTINGS: 'capcut_translator_style_settings',
+  STYLE_TOGGLES: 'capcut_translator_style_toggles',
+  TITLE_FONT_SETTINGS: 'capcut_translator_title_font_settings',
+  TITLE_STYLE_SETTINGS: 'capcut_translator_title_style_settings',
 };
 
 // 기본 스타일 (한국어 원본에서 가져올 수 없을 때 사용)

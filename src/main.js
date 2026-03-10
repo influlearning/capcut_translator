@@ -8,7 +8,7 @@ import { parseProject, applyReplacements, summarizeSubtitles } from './core/capc
 import { parseSheetUrl, fetchTabList, fetchSheetData, findTabByGid } from './core/sheet-client.js';
 import { matchSubtitles, rematchRow } from './core/matcher.js';
 import { extractProject, packageProject, downloadBlob } from './utils/zip-handler.js';
-import { loadSheetUrl, saveSheetUrl, loadFontSettings, saveFontSettings, loadStyleSettings, saveStyleSettings } from './utils/storage.js';
+import { loadSheetUrl, saveSheetUrl, loadFontSettings, saveFontSettings, loadStyleSettings, saveStyleSettings, loadStyleToggles, saveStyleToggles, loadTitleFontSettings, saveTitleFontSettings, loadTitleStyleSettings, saveTitleStyleSettings } from './utils/storage.js';
 
 // 전역 상태
 const state = {
@@ -26,6 +26,9 @@ const state = {
   targetLangs: ['cn', 'jp'],  // 체크박스: 둘 다 기본 선택
   fontConfigs: {},   // { cn: {...}, jp: {...} }
   styleConfigs: {},  // { cn: {...}, jp: {...} }
+  styleToggles: {},  // { cn: { enabled, subtitle: {font,color,size}, title: {...} }, jp: {...} }
+  titleFontConfigs: {},  // 타이틀 전용 폰트 설정
+  titleStyleConfigs: {}, // 타이틀 전용 스타일 설정
   // Step 4: 매칭 (언어별)
   matchResultsByLang: {},  // { cn: [...], jp: [...] }
   // Step 5: 결과 (언어별)
@@ -294,16 +297,102 @@ function bindStep2() {
 }
 
 // =============================================
-// Step 3: 설정 (멀티 언어 체크박스)
+// Step 3: 설정 (멀티 언어 + 스타일 토글)
 // =============================================
+
+// 기본 토글 상태 (전부 꺼짐 = 원본 스타일 유지)
+function getDefaultToggles() {
+  return {
+    enabled: false,
+    subtitle: { font: false, color: false, size: false },
+    title: { font: false, color: false, size: false },
+  };
+}
+
+// 스타일 섹션 HTML 생성 (자막/타이틀 공용)
+function renderStyleSection(lang, section, toggles, fontSettings, styleSettings, origFontPath, origFontId) {
+  const sectionLabel = section === 'subtitle' ? '자막' : '타이틀';
+  const prefix = `${section}-${lang}`;
+  const t = toggles || {};
+
+  const fontDisabled = !t.font ? 'disabled' : '';
+  const colorDisabled = !t.color ? 'disabled' : '';
+  const sizeDisabled = !t.size ? 'disabled' : '';
+
+  return `
+    <div class="style-section">
+      <h4>${sectionLabel}</h4>
+
+      <div class="toggle-group">
+        <input type="checkbox" class="section-toggle" id="toggle-font-${prefix}"
+          data-lang="${lang}" data-section="${section}" data-field="font"
+          ${t.font ? 'checked' : ''}>
+        <label for="toggle-font-${prefix}">폰트</label>
+      </div>
+      <div class="settings-grid" style="margin-bottom:16px;">
+        <div class="input-group">
+          <label>폰트 경로</label>
+          <input type="text" id="font-path-${prefix}" placeholder="${origFontPath || '/Users/.../font.ttf'}" value="${fontSettings.fontPath || ''}" ${fontDisabled}>
+        </div>
+        <div class="input-group">
+          <label>폰트 ID</label>
+          <input type="text" id="font-id-${prefix}" placeholder="${origFontId || '6808056385679397389'}" value="${fontSettings.fontId || ''}" ${fontDisabled}>
+        </div>
+        <div class="input-group">
+          <label>폰트 이름</label>
+          <input type="text" id="font-title-${prefix}" placeholder="예: 고딕체" value="${fontSettings.fontTitle || ''}" ${fontDisabled}>
+        </div>
+      </div>
+
+      <div class="toggle-group">
+        <input type="checkbox" class="section-toggle" id="toggle-color-${prefix}"
+          data-lang="${lang}" data-section="${section}" data-field="color"
+          ${t.color ? 'checked' : ''}>
+        <label for="toggle-color-${prefix}">색상</label>
+      </div>
+      <div class="settings-grid" style="margin-bottom:16px;">
+        <div class="input-group">
+          <label>텍스트 색상</label>
+          <input type="color" id="text-color-${prefix}" value="${styleSettings.textColor || '#ffffff'}" style="height:40px;" ${colorDisabled}>
+        </div>
+        <div class="input-group">
+          <label>테두리 색상</label>
+          <input type="color" id="border-color-${prefix}" value="${styleSettings.borderColor || '#000000'}" style="height:40px;" ${colorDisabled}>
+        </div>
+      </div>
+
+      <div class="toggle-group">
+        <input type="checkbox" class="section-toggle" id="toggle-size-${prefix}"
+          data-lang="${lang}" data-section="${section}" data-field="size"
+          ${t.size ? 'checked' : ''}>
+        <label for="toggle-size-${prefix}">크기</label>
+      </div>
+      <div class="settings-grid">
+        <div class="input-group">
+          <label>글씨 크기</label>
+          <input type="number" id="font-size-${prefix}" step="0.5" min="1" max="30" value="${styleSettings.fontSize || '10'}" ${sizeDisabled}>
+        </div>
+        <div class="input-group">
+          <label>테두리 두께 (0~0.15)</label>
+          <input type="number" id="border-width-${prefix}" step="0.01" min="0" max="0.15" value="${styleSettings.borderWidth || '0.08'}" ${sizeDisabled}>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function renderStep3() {
   const savedFont = loadFontSettings();
   const savedStyle = loadStyleSettings();
+  const savedToggles = loadStyleToggles();
+  const savedTitleFont = loadTitleFontSettings();
+  const savedTitleStyle = loadTitleStyleSettings();
 
   // 원본 프로젝트에서 기본 스타일 추출
   const firstSub = state.parsedProject?.subtitles?.[0];
   const origFontPath = firstSub?.rawMaterial?.font_path || '';
   const origFontId = firstSub?.rawMaterial?.font_id || '';
+  const hasTitle = !!state.parsedProject?.title;
 
   const langOptions = [
     { code: 'cn', label: '中文 (중국어)' },
@@ -316,48 +405,34 @@ function renderStep3() {
 
   // 선택된 언어별 설정 패널
   const langPanels = state.targetLangs.map(lang => {
-    const langFont = savedFont[lang] || {};
-    const langStyle = savedStyle[lang] || {};
     const langLabel = lang === 'cn' ? '중국어' : '일본어';
+    const toggles = savedToggles[lang] || getDefaultToggles();
+
+    // 자막 설정
+    const subFont = savedFont[lang] || {};
+    const subStyle = savedStyle[lang] || {};
+    const subSection = renderStyleSection(lang, 'subtitle', toggles.subtitle, subFont, subStyle, origFontPath, origFontId);
+
+    // 타이틀 설정 (타이틀이 있을 때만)
+    let titleSection = '';
+    if (hasTitle) {
+      const titleFont = savedTitleFont[lang] || {};
+      const titleStyle = savedTitleStyle[lang] || {};
+      titleSection = renderStyleSection(lang, 'title', toggles.title, titleFont, titleStyle, origFontPath, origFontId);
+    }
 
     return `
       <div style="margin-top:20px;padding:16px;background:var(--bg);border-radius:var(--radius);">
         <h3 style="font-size:15px;margin-bottom:12px;">${langLabel} 설정</h3>
 
-        <h4 style="font-size:13px;color:var(--text-muted);margin-bottom:8px;">폰트</h4>
-        <div class="settings-grid">
-          <div class="input-group">
-            <label>폰트 경로</label>
-            <input type="text" id="font-path-${lang}" placeholder="${origFontPath || '/Users/.../font.ttf'}" value="${langFont.fontPath || ''}">
-          </div>
-          <div class="input-group">
-            <label>폰트 ID</label>
-            <input type="text" id="font-id-${lang}" placeholder="${origFontId || '6808056385679397389'}" value="${langFont.fontId || ''}">
-          </div>
-          <div class="input-group">
-            <label>폰트 이름</label>
-            <input type="text" id="font-title-${lang}" placeholder="예: 고딕체" value="${langFont.fontTitle || ''}">
-          </div>
+        <div class="toggle-group master-toggle" style="margin-bottom:16px;">
+          <input type="checkbox" id="style-enabled-${lang}" ${toggles.enabled ? 'checked' : ''}>
+          <label for="style-enabled-${lang}">스타일 수정</label>
         </div>
 
-        <h4 style="font-size:13px;color:var(--text-muted);margin:12px 0 8px;">스타일</h4>
-        <div class="settings-grid">
-          <div class="input-group">
-            <label>텍스트 색상</label>
-            <input type="color" id="text-color-${lang}" value="${langStyle.textColor || '#ffffff'}" style="height:40px;">
-          </div>
-          <div class="input-group">
-            <label>테두리 색상</label>
-            <input type="color" id="border-color-${lang}" value="${langStyle.borderColor || '#000000'}" style="height:40px;">
-          </div>
-          <div class="input-group">
-            <label>테두리 두께 (0~0.15)</label>
-            <input type="number" id="border-width-${lang}" step="0.01" min="0" max="0.15" value="${langStyle.borderWidth || '0.08'}">
-          </div>
-          <div class="input-group">
-            <label>글씨 크기</label>
-            <input type="number" id="font-size-${lang}" step="0.5" min="1" max="30" value="${langStyle.fontSize || '10'}">
-          </div>
+        <div id="style-options-${lang}" style="${toggles.enabled ? '' : 'display:none;'}">
+          ${subSection}
+          ${titleSection}
         </div>
       </div>
     `;
@@ -377,6 +452,7 @@ function renderStep3() {
       ${langPanels}
 
       <p style="font-size:12px;color:var(--text-muted);margin-top:12px;">
+        * 스타일 수정을 끄면 원본 프로젝트의 폰트/색상/크기가 그대로 유지됩니다.<br>
         * 폰트 경로/ID는 CapCut에서 해당 폰트를 한 번 사용한 뒤, 프로젝트 파일에서 확인할 수 있습니다.<br>
         * 원본 폰트 경로: <code style="font-size:11px;">${origFontPath || '(프로젝트 업로드 후 표시)'}</code>
       </p>
@@ -389,14 +465,36 @@ function renderStep3() {
 }
 
 function bindStep3() {
+  // 언어 체크박스
   document.querySelectorAll('input[name="target-lang"]').forEach(cb => {
     cb.addEventListener('change', () => {
+      saveCurrentSettings();
       state.targetLangs = [...document.querySelectorAll('input[name="target-lang"]:checked')]
         .map(el => el.value);
-      render(); // 체크 상태 변경 시 설정 패널 갱신
+      render();
     });
   });
 
+  // 마스터 토글 (스타일 수정 ON/OFF)
+  state.targetLangs.forEach(lang => {
+    const masterToggle = document.getElementById(`style-enabled-${lang}`);
+    if (masterToggle) {
+      masterToggle.addEventListener('change', () => {
+        saveCurrentSettings();
+        render();
+      });
+    }
+  });
+
+  // 개별 토글 (폰트/색상/크기) → 입력 필드 disabled 토글
+  document.querySelectorAll('.section-toggle').forEach(toggle => {
+    toggle.addEventListener('change', () => {
+      saveCurrentSettings();
+      render();
+    });
+  });
+
+  // 네비게이션
   document.getElementById('prev-btn').addEventListener('click', () => { state.currentStep = 2; render(); });
   document.getElementById('next-btn').addEventListener('click', () => {
     if (state.targetLangs.length === 0) return alert('언어를 최소 1개 선택해주세요.');
@@ -421,28 +519,69 @@ function bindStep3() {
 }
 
 function saveCurrentSettings() {
-  const fontSettings = loadFontSettings();
-  const styleSettings = loadStyleSettings();
+  const fontSettings = {};
+  const styleSettings = {};
+  const toggleSettings = {};
+  const titleFontSettings = {};
+  const titleStyleSettings = {};
 
   for (const lang of state.targetLangs) {
+    // 토글 상태 읽기
+    const enabled = document.getElementById(`style-enabled-${lang}`)?.checked || false;
+    toggleSettings[lang] = {
+      enabled,
+      subtitle: {
+        font: document.getElementById(`toggle-font-subtitle-${lang}`)?.checked || false,
+        color: document.getElementById(`toggle-color-subtitle-${lang}`)?.checked || false,
+        size: document.getElementById(`toggle-size-subtitle-${lang}`)?.checked || false,
+      },
+      title: {
+        font: document.getElementById(`toggle-font-title-${lang}`)?.checked || false,
+        color: document.getElementById(`toggle-color-title-${lang}`)?.checked || false,
+        size: document.getElementById(`toggle-size-title-${lang}`)?.checked || false,
+      },
+    };
+
+    // 자막 설정
     fontSettings[lang] = {
-      fontPath: document.getElementById(`font-path-${lang}`)?.value || '',
-      fontId: document.getElementById(`font-id-${lang}`)?.value || '',
-      fontTitle: document.getElementById(`font-title-${lang}`)?.value || '',
-      fontResourceId: document.getElementById(`font-id-${lang}`)?.value || '',
+      fontPath: document.getElementById(`font-path-subtitle-${lang}`)?.value || '',
+      fontId: document.getElementById(`font-id-subtitle-${lang}`)?.value || '',
+      fontTitle: document.getElementById(`font-title-subtitle-${lang}`)?.value || '',
+      fontResourceId: document.getElementById(`font-id-subtitle-${lang}`)?.value || '',
     };
     styleSettings[lang] = {
-      textColor: document.getElementById(`text-color-${lang}`)?.value || '#ffffff',
-      borderColor: document.getElementById(`border-color-${lang}`)?.value || '#000000',
-      borderWidth: parseFloat(document.getElementById(`border-width-${lang}`)?.value || '0.08'),
-      fontSize: parseFloat(document.getElementById(`font-size-${lang}`)?.value || '10'),
+      textColor: document.getElementById(`text-color-subtitle-${lang}`)?.value || '#ffffff',
+      borderColor: document.getElementById(`border-color-subtitle-${lang}`)?.value || '#000000',
+      borderWidth: parseFloat(document.getElementById(`border-width-subtitle-${lang}`)?.value || '0.08'),
+      fontSize: parseFloat(document.getElementById(`font-size-subtitle-${lang}`)?.value || '10'),
+    };
+
+    // 타이틀 설정
+    titleFontSettings[lang] = {
+      fontPath: document.getElementById(`font-path-title-${lang}`)?.value || '',
+      fontId: document.getElementById(`font-id-title-${lang}`)?.value || '',
+      fontTitle: document.getElementById(`font-title-title-${lang}`)?.value || '',
+      fontResourceId: document.getElementById(`font-id-title-${lang}`)?.value || '',
+    };
+    titleStyleSettings[lang] = {
+      textColor: document.getElementById(`text-color-title-${lang}`)?.value || '#ffffff',
+      borderColor: document.getElementById(`border-color-title-${lang}`)?.value || '#000000',
+      borderWidth: parseFloat(document.getElementById(`border-width-title-${lang}`)?.value || '0.08'),
+      fontSize: parseFloat(document.getElementById(`font-size-title-${lang}`)?.value || '10'),
     };
   }
 
   saveFontSettings(fontSettings);
   saveStyleSettings(styleSettings);
+  saveStyleToggles(toggleSettings);
+  saveTitleFontSettings(titleFontSettings);
+  saveTitleStyleSettings(titleStyleSettings);
+
   state.fontConfigs = fontSettings;
   state.styleConfigs = styleSettings;
+  state.styleToggles = toggleSettings;
+  state.titleFontConfigs = titleFontSettings;
+  state.titleStyleConfigs = titleStyleSettings;
 }
 
 // =============================================
@@ -612,20 +751,64 @@ async function startConversion() {
       const langLabel = lang.toUpperCase();
       logger.info(CATEGORIES.CONVERT, `${langLabel} 변환 시작`);
 
-      // 해당 언어의 폰트/스타일 설정
+      // 토글 상태 확인
+      const toggles = state.styleToggles[lang] || getDefaultToggles();
+
+      // ── 자막용 fontConfig/styleConfig (토글에 따라 선택적 적용) ──
       const langFontConfig = state.fontConfigs[lang] || {};
       const langStyleConfig = state.styleConfigs[lang] || {};
 
-      const fontConfig = langFontConfig.fontPath ? langFontConfig : null;
-      const styleConfig = langStyleConfig.textColor ? {
-        fillColor: hexToRgb(langStyleConfig.textColor),
-        strokeColor: hexToRgb(langStyleConfig.borderColor),
-        strokeWidth: langStyleConfig.borderWidth,
-        fontSize: langStyleConfig.fontSize,
-        textColor: langStyleConfig.textColor,
-        borderColor: langStyleConfig.borderColor,
-        borderWidth: langStyleConfig.borderWidth,
-      } : null;
+      const subtitleFontConfig = (toggles.enabled && toggles.subtitle?.font && langFontConfig.fontPath)
+        ? langFontConfig : null;
+
+      let subtitleStyleConfig = null;
+      if (toggles.enabled) {
+        const sc = {};
+        if (toggles.subtitle?.color && langStyleConfig.textColor) {
+          sc.fillColor = hexToRgb(langStyleConfig.textColor);
+          sc.strokeColor = hexToRgb(langStyleConfig.borderColor);
+          sc.textColor = langStyleConfig.textColor;
+          sc.borderColor = langStyleConfig.borderColor;
+        }
+        if (toggles.subtitle?.size) {
+          if (langStyleConfig.borderWidth !== undefined) {
+            sc.strokeWidth = langStyleConfig.borderWidth;
+            sc.borderWidth = langStyleConfig.borderWidth;
+          }
+          if (langStyleConfig.fontSize) {
+            sc.fontSize = langStyleConfig.fontSize;
+          }
+        }
+        if (Object.keys(sc).length > 0) subtitleStyleConfig = sc;
+      }
+
+      // ── 타이틀용 fontConfig/styleConfig (별도 설정) ──
+      const tFontConf = state.titleFontConfigs[lang] || {};
+      const tStyleConf = state.titleStyleConfigs[lang] || {};
+
+      const titleFontConfig = (toggles.enabled && toggles.title?.font && tFontConf.fontPath)
+        ? tFontConf : null;
+
+      let titleStyleConfig = null;
+      if (toggles.enabled) {
+        const sc = {};
+        if (toggles.title?.color && tStyleConf.textColor) {
+          sc.fillColor = hexToRgb(tStyleConf.textColor);
+          sc.strokeColor = hexToRgb(tStyleConf.borderColor);
+          sc.textColor = tStyleConf.textColor;
+          sc.borderColor = tStyleConf.borderColor;
+        }
+        if (toggles.title?.size) {
+          if (tStyleConf.borderWidth !== undefined) {
+            sc.strokeWidth = tStyleConf.borderWidth;
+            sc.borderWidth = tStyleConf.borderWidth;
+          }
+          if (tStyleConf.fontSize) {
+            sc.fontSize = tStyleConf.fontSize;
+          }
+        }
+        if (Object.keys(sc).length > 0) titleStyleConfig = sc;
+      }
 
       // 해당 언어의 매칭 결과에서 교체 목록 생성
       const matchResults = state.matchResultsByLang[lang] || [];
@@ -634,8 +817,8 @@ async function startConversion() {
         .map(r => ({
           materialId: r.materialId,
           newTranslation: r.sheetTarget,
-          fontConfig,
-          styleConfig,
+          fontConfig: r.type === 'title' ? titleFontConfig : subtitleFontConfig,
+          styleConfig: r.type === 'title' ? titleStyleConfig : subtitleStyleConfig,
           isEnglishOnly: state.parsedProject.isEnglishOnly,
           isTitle: r.type === 'title',
         }));

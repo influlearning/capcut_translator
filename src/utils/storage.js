@@ -56,3 +56,34 @@ export function saveStyleSettings(settings) {
 export function loadStyleSettings() {
   return load(STORAGE_KEYS.STYLE_SETTINGS, {});
 }
+
+/**
+ * 스타일 수정 토글 상태 저장/불러오기
+ * 형태: { cn: { enabled, subtitle: {font,color,size}, title: {font,color,size} }, jp: {...} }
+ */
+export function saveStyleToggles(settings) {
+  save(STORAGE_KEYS.STYLE_TOGGLES, settings);
+}
+
+export function loadStyleToggles() {
+  return load(STORAGE_KEYS.STYLE_TOGGLES, {});
+}
+
+/**
+ * 타이틀 전용 폰트/스타일 설정 저장/불러오기
+ */
+export function saveTitleFontSettings(settings) {
+  save(STORAGE_KEYS.TITLE_FONT_SETTINGS, settings);
+}
+
+export function loadTitleFontSettings() {
+  return load(STORAGE_KEYS.TITLE_FONT_SETTINGS, {});
+}
+
+export function saveTitleStyleSettings(settings) {
+  save(STORAGE_KEYS.TITLE_STYLE_SETTINGS, settings);
+}
+
+export function loadTitleStyleSettings() {
+  return load(STORAGE_KEYS.TITLE_STYLE_SETTINGS, {});
+}
