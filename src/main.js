@@ -7,7 +7,7 @@ import { logger, CATEGORIES } from './core/logger.js';
 import { parseProject, applyReplacements, summarizeSubtitles } from './core/capcut-parser.js';
 import { parseSheetUrl, fetchTabList, fetchSheetData, findTabByGid } from './core/sheet-client.js';
 import { matchSubtitles, rematchRow } from './core/matcher.js';
-import { extractProject, packageProject, downloadBlob } from './utils/zip-handler.js';
+import { extractProject, packageProject, exportToFolder, downloadBlob } from './utils/zip-handler.js';
 import { loadSheetUrl, saveSheetUrl, loadFontSettings, saveFontSettings, loadStyleSettings, saveStyleSettings, loadStyleToggles, saveStyleToggles, loadTitleFontSettings, saveTitleFontSettings, loadTitleStyleSettings, saveTitleStyleSettings } from './utils/storage.js';
 
 // 전역 상태
@@ -29,12 +29,16 @@ const state = {
   styleToggles: {},  // { cn: { enabled, subtitle: {font,color,size}, title: {...} }, jp: {...} }
   titleFontConfigs: {},  // 타이틀 전용 폰트 설정
   titleStyleConfigs: {}, // 타이틀 전용 스타일 설정
+  // Step 2: 탭 직접 입력 모드
+  customTabMode: false,
   // Step 4: 매칭 (언어별)
   matchResultsByLang: {},  // { cn: [...], jp: [...] }
   // Step 5: 결과 (언어별)
   converting: false,
   downloadReady: false,
   resultBlobs: {},  // { cn: Blob, jp: Blob }
+  exportMode: 'zip',       // 'zip' | 'folder'
+  exportedFolders: {},     // { cn: 'S_290_CN', jp: 'S_290_JP' }
 };
 
 // DOM 마운트
@@ -172,7 +176,27 @@ function bindStep1() {
     if (fileInput.files[0]) await handleProjectUpload(fileInput.files[0]);
   });
 
-  document.getElementById('folder-btn').addEventListener('click', () => folderInput.click());
+  document.getElementById('folder-btn').addEventListener('click', async () => {
+    // File System Access API: 기본 위치를 ~/Movies 근처로 열기
+    if (window.showDirectoryPicker) {
+      try {
+        const dirHandle = await window.showDirectoryPicker({
+          id: 'capcut-input',
+          startIn: 'videos',
+          mode: 'read',
+        });
+        await handleProjectUpload(dirHandle);
+      } catch (e) {
+        if (e.name !== 'AbortError') {
+          logger.error(CATEGORIES.UI, `폴더 선택 실패: ${e.message}`);
+          alert(`폴더 선택 실패: ${e.message}`);
+        }
+      }
+    } else {
+      folderInput.click();
+    }
+  });
+  // webkitdirectory 폴백
   folderInput.addEventListener('change', async () => {
     if (folderInput.files.length > 0) await handleProjectUpload(folderInput.files);
   });
@@ -240,8 +264,15 @@ function renderStep2() {
           <select id="tab-select">
             <option value="">탭을 선택하세요</option>
             ${tabOptions}
+            <option value="__custom__" ${state.customTabMode ? 'selected' : ''}>직접 입력...</option>
           </select>
         </div>
+        ${state.customTabMode ? `
+          <div class="input-group" style="margin-top:8px;">
+            <label>탭 이름</label>
+            <input type="text" id="custom-tab-name" placeholder="탭 이름을 입력하세요" value="${state.selectedTab || ''}">
+          </div>
+        ` : ''}
         <button class="btn btn-primary" id="load-data-btn" ${state.selectedTab ? '' : 'disabled'}>데이터 불러오기</button>
       ` : ''}
 
@@ -282,8 +313,25 @@ function bindStep2() {
   const tabSelect = document.getElementById('tab-select');
   if (tabSelect) {
     tabSelect.addEventListener('change', () => {
-      state.selectedTab = tabSelect.value;
+      if (tabSelect.value === '__custom__') {
+        state.customTabMode = true;
+        state.selectedTab = '';
+      } else {
+        state.customTabMode = false;
+        state.selectedTab = tabSelect.value;
+      }
       render();
+    });
+  }
+
+  // 직접 입력 모드: 탭 이름 입력 필드
+  const customTabInput = document.getElementById('custom-tab-name');
+  if (customTabInput) {
+    customTabInput.focus();
+    customTabInput.addEventListener('input', () => {
+      state.selectedTab = customTabInput.value.trim();
+      const loadBtn = document.getElementById('load-data-btn');
+      if (loadBtn) loadBtn.disabled = !state.selectedTab;
     });
   }
 
@@ -686,6 +734,31 @@ function bindStep4() {
 // =============================================
 function renderStep5() {
   if (state.downloadReady) {
+    if (state.exportMode === 'folder') {
+      // 폴더 내보내기 완료
+      const folderList = state.targetLangs.map(lang => {
+        const folderName = state.exportedFolders[lang] || '?';
+        const langName = lang === 'cn' ? '중국어' : '일본어';
+        return `<div class="summary-row"><span>${langName}</span><span>${folderName}</span></div>`;
+      }).join('');
+
+      return `
+        <div class="card" style="text-align:center;">
+          <h2>내보내기 완료!</h2>
+          <p style="margin:16px 0;">캡컷 폴더에 성공적으로 내보냈습니다.</p>
+          <div class="summary" style="max-width:400px;margin:0 auto;">${folderList}</div>
+          <div style="margin-top:12px;">
+            <button class="btn btn-secondary" id="log-btn">로그 다운로드</button>
+          </div>
+        </div>
+        <div class="nav-buttons">
+          <button class="btn btn-secondary" id="prev-btn">← 이전</button>
+          <button class="btn btn-secondary" id="restart-btn">처음으로</button>
+        </div>
+      `;
+    }
+
+    // ZIP 다운로드 완료
     const downloadBtns = state.targetLangs.map(lang => {
       const langName = lang === 'cn' ? '중국어' : '일본어';
       return `<button class="btn btn-success download-lang-btn" data-lang="${lang}" style="font-size:16px;padding:14px 32px;margin:4px;">${langName} ZIP 다운로드</button>`;
@@ -709,14 +782,23 @@ function renderStep5() {
     `;
   }
 
+  const hasFileSystemAccess = !!window.showDirectoryPicker;
+
   return `
     <div class="card" style="text-align:center;">
-      <h2>5. 변환</h2>
-      <p style="margin:16px 0;">변환을 시작하면 언어별 수정된 캡컷 프로젝트를 ZIP으로 다운로드할 수 있습니다.</p>
+      <h2>5. 변환 & 내보내기</h2>
+      <p style="margin:16px 0;">언어별 수정된 캡컷 프로젝트를 ZIP으로 다운로드하거나 폴더로 직접 내보냅니다.</p>
       <p style="font-size:13px;color:var(--text-muted);">대상: ${state.targetLangs.map(l => l === 'cn' ? '중국어' : '일본어').join(', ')}</p>
-      <button class="btn btn-primary" id="convert-btn" style="font-size:16px;padding:14px 32px;" ${state.converting ? 'disabled' : ''}>
-        ${state.converting ? '변환 중...' : '변환 시작'}
-      </button>
+      <div style="display:flex;gap:12px;justify-content:center;margin-top:16px;">
+        <button class="btn btn-primary" id="convert-zip-btn" ${state.converting ? 'disabled' : ''}>
+          ${state.converting && state.exportMode === 'zip' ? '변환 중...' : 'ZIP 다운로드'}
+        </button>
+        ${hasFileSystemAccess ? `
+          <button class="btn btn-primary" id="convert-export-btn" ${state.converting ? 'disabled' : ''}>
+            ${state.converting && state.exportMode === 'folder' ? '내보내기 중...' : '캡컷 폴더에 내보내기'}
+          </button>
+        ` : ''}
+      </div>
       <div class="progress-bar" id="progress" style="display:${state.converting ? 'block' : 'none'}">
         <div class="progress-fill" id="progress-fill" style="width:0%"></div>
       </div>
@@ -731,7 +813,8 @@ function renderStep5() {
 function bindStep5() {
   document.getElementById('prev-btn')?.addEventListener('click', () => { state.currentStep = 4; render(); });
 
-  document.getElementById('convert-btn')?.addEventListener('click', startConversion);
+  document.getElementById('convert-zip-btn')?.addEventListener('click', startConversion);
+  document.getElementById('convert-export-btn')?.addEventListener('click', startExportToFolder);
 
   document.querySelectorAll('.download-lang-btn').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -747,23 +830,95 @@ function bindStep5() {
     state.currentStep = 1;
     state.downloadReady = false;
     state.resultBlobs = {};
+    state.exportedFolders = {};
     render();
   });
 }
 
+// hex 색상을 [r,g,b] 배열 (0~1)로 변환
+function hexToRgb(hex) {
+  const r = parseInt(hex.slice(1, 3), 16) / 255;
+  const g = parseInt(hex.slice(3, 5), 16) / 255;
+  const b = parseInt(hex.slice(5, 7), 16) / 255;
+  return [r, g, b];
+}
+
+/**
+ * 언어별 교체 목록 생성 (ZIP/폴더 내보내기 공용)
+ */
+function buildLangReplacements(lang) {
+  const toggles = state.styleToggles[lang] || getDefaultToggles();
+  const langFontConfig = state.fontConfigs[lang] || {};
+  const langStyleConfig = state.styleConfigs[lang] || {};
+
+  // 자막용
+  const subtitleFontConfig = (toggles.enabled && toggles.subtitle?.font && langFontConfig.fontPath)
+    ? langFontConfig : null;
+
+  let subtitleStyleConfig = null;
+  if (toggles.enabled) {
+    const sc = {};
+    if (toggles.subtitle?.color && langStyleConfig.textColor) {
+      sc.fillColor = hexToRgb(langStyleConfig.textColor);
+      sc.strokeColor = hexToRgb(langStyleConfig.borderColor);
+      sc.textColor = langStyleConfig.textColor;
+      sc.borderColor = langStyleConfig.borderColor;
+    }
+    if (toggles.subtitle?.size) {
+      if (langStyleConfig.borderWidth !== undefined) {
+        sc.strokeWidth = langStyleConfig.borderWidth;
+        sc.borderWidth = langStyleConfig.borderWidth;
+      }
+      if (langStyleConfig.fontSize) sc.fontSize = langStyleConfig.fontSize;
+    }
+    if (Object.keys(sc).length > 0) subtitleStyleConfig = sc;
+  }
+
+  // 타이틀용
+  const tFontConf = state.titleFontConfigs[lang] || {};
+  const tStyleConf = state.titleStyleConfigs[lang] || {};
+
+  const titleFontConfig = (toggles.enabled && toggles.title?.font && tFontConf.fontPath)
+    ? tFontConf : null;
+
+  let titleStyleConfig = null;
+  if (toggles.enabled) {
+    const sc = {};
+    if (toggles.title?.color && tStyleConf.textColor) {
+      sc.fillColor = hexToRgb(tStyleConf.textColor);
+      sc.strokeColor = hexToRgb(tStyleConf.borderColor);
+      sc.textColor = tStyleConf.textColor;
+      sc.borderColor = tStyleConf.borderColor;
+    }
+    if (toggles.title?.size) {
+      if (tStyleConf.borderWidth !== undefined) {
+        sc.strokeWidth = tStyleConf.borderWidth;
+        sc.borderWidth = tStyleConf.borderWidth;
+      }
+      if (tStyleConf.fontSize) sc.fontSize = tStyleConf.fontSize;
+    }
+    if (Object.keys(sc).length > 0) titleStyleConfig = sc;
+  }
+
+  const matchResults = state.matchResultsByLang[lang] || [];
+  return matchResults
+    .filter(r => r.materialId && r.sheetTarget && (r.status === 'matched' || r.status === 'mismatch'))
+    .map(r => ({
+      materialId: r.materialId,
+      newTranslation: r.sheetTarget,
+      fontConfig: r.type === 'title' ? titleFontConfig : subtitleFontConfig,
+      styleConfig: r.type === 'title' ? titleStyleConfig : subtitleStyleConfig,
+      isEnglishOnly: state.parsedProject.isEnglishOnly,
+      isTitle: r.type === 'title',
+    }));
+}
+
 async function startConversion() {
   state.converting = true;
+  state.exportMode = 'zip';
   render();
 
   try {
-    // hex 색상을 [r,g,b] 배열 (0~1)로 변환
-    const hexToRgb = (hex) => {
-      const r = parseInt(hex.slice(1, 3), 16) / 255;
-      const g = parseInt(hex.slice(3, 5), 16) / 255;
-      const b = parseInt(hex.slice(5, 7), 16) / 255;
-      return [r, g, b];
-    };
-
     const totalLangs = state.targetLangs.length;
     let completed = 0;
 
@@ -771,84 +926,11 @@ async function startConversion() {
       const langLabel = lang.toUpperCase();
       logger.info(CATEGORIES.CONVERT, `${langLabel} 변환 시작`);
 
-      // 토글 상태 확인
-      const toggles = state.styleToggles[lang] || getDefaultToggles();
-
-      // ── 자막용 fontConfig/styleConfig (토글에 따라 선택적 적용) ──
-      const langFontConfig = state.fontConfigs[lang] || {};
-      const langStyleConfig = state.styleConfigs[lang] || {};
-
-      const subtitleFontConfig = (toggles.enabled && toggles.subtitle?.font && langFontConfig.fontPath)
-        ? langFontConfig : null;
-
-      let subtitleStyleConfig = null;
-      if (toggles.enabled) {
-        const sc = {};
-        if (toggles.subtitle?.color && langStyleConfig.textColor) {
-          sc.fillColor = hexToRgb(langStyleConfig.textColor);
-          sc.strokeColor = hexToRgb(langStyleConfig.borderColor);
-          sc.textColor = langStyleConfig.textColor;
-          sc.borderColor = langStyleConfig.borderColor;
-        }
-        if (toggles.subtitle?.size) {
-          if (langStyleConfig.borderWidth !== undefined) {
-            sc.strokeWidth = langStyleConfig.borderWidth;
-            sc.borderWidth = langStyleConfig.borderWidth;
-          }
-          if (langStyleConfig.fontSize) {
-            sc.fontSize = langStyleConfig.fontSize;
-          }
-        }
-        if (Object.keys(sc).length > 0) subtitleStyleConfig = sc;
-      }
-
-      // ── 타이틀용 fontConfig/styleConfig (별도 설정) ──
-      const tFontConf = state.titleFontConfigs[lang] || {};
-      const tStyleConf = state.titleStyleConfigs[lang] || {};
-
-      const titleFontConfig = (toggles.enabled && toggles.title?.font && tFontConf.fontPath)
-        ? tFontConf : null;
-
-      let titleStyleConfig = null;
-      if (toggles.enabled) {
-        const sc = {};
-        if (toggles.title?.color && tStyleConf.textColor) {
-          sc.fillColor = hexToRgb(tStyleConf.textColor);
-          sc.strokeColor = hexToRgb(tStyleConf.borderColor);
-          sc.textColor = tStyleConf.textColor;
-          sc.borderColor = tStyleConf.borderColor;
-        }
-        if (toggles.title?.size) {
-          if (tStyleConf.borderWidth !== undefined) {
-            sc.strokeWidth = tStyleConf.borderWidth;
-            sc.borderWidth = tStyleConf.borderWidth;
-          }
-          if (tStyleConf.fontSize) {
-            sc.fontSize = tStyleConf.fontSize;
-          }
-        }
-        if (Object.keys(sc).length > 0) titleStyleConfig = sc;
-      }
-
-      // 해당 언어의 매칭 결과에서 교체 목록 생성
-      const matchResults = state.matchResultsByLang[lang] || [];
-      const replacements = matchResults
-        .filter(r => r.materialId && r.sheetTarget && (r.status === 'matched' || r.status === 'mismatch'))
-        .map(r => ({
-          materialId: r.materialId,
-          newTranslation: r.sheetTarget,
-          fontConfig: r.type === 'title' ? titleFontConfig : subtitleFontConfig,
-          styleConfig: r.type === 'title' ? titleStyleConfig : subtitleStyleConfig,
-          isEnglishOnly: state.parsedProject.isEnglishOnly,
-          isTitle: r.type === 'title',
-        }));
-
+      const replacements = buildLangReplacements(lang);
       logger.info(CATEGORIES.CONVERT, `${langLabel}: ${replacements.length}건 교체`);
 
-      // 변환 실행 (원본에서 깊은 복사 후 적용)
       const modifiedDraftInfo = applyReplacements(state.projectData.draftInfo, replacements);
 
-      // ZIP 패키징
       state.resultBlobs[lang] = await packageProject(
         state.projectData.files,
         modifiedDraftInfo,
@@ -869,6 +951,71 @@ async function startConversion() {
     state.converting = false;
     logger.error(CATEGORIES.CONVERT, `변환 실패: ${e.message}`, { stack: e.stack });
     alert(`변환 실패: ${e.message}\n\n로그를 다운로드해서 확인해주세요.`);
+    render();
+  }
+}
+
+async function startExportToFolder() {
+  if (!window.showDirectoryPicker) {
+    alert('이 브라우저에서는 폴더 내보내기를 지원하지 않습니다. Chrome을 사용해주세요.');
+    return;
+  }
+
+  // 내보낼 상위 폴더 선택 (캡컷 프로젝트 폴더)
+  let parentDirHandle;
+  try {
+    parentDirHandle = await window.showDirectoryPicker({
+      id: 'capcut-output',
+      startIn: 'videos',
+      mode: 'readwrite',
+    });
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    alert(`폴더 선택 실패: ${e.message}`);
+    return;
+  }
+
+  state.converting = true;
+  state.exportMode = 'folder';
+  state.exportedFolders = {};
+  render();
+
+  try {
+    const totalLangs = state.targetLangs.length;
+    let completed = 0;
+
+    for (const lang of state.targetLangs) {
+      const langLabel = lang.toUpperCase();
+      logger.info(CATEGORIES.CONVERT, `${langLabel} 내보내기 시작`);
+
+      const replacements = buildLangReplacements(lang);
+      logger.info(CATEGORIES.CONVERT, `${langLabel}: ${replacements.length}건 교체`);
+
+      const modifiedDraftInfo = applyReplacements(state.projectData.draftInfo, replacements);
+
+      // 폴더로 직접 내보내기 (동일 이름 충돌 시 자동 번호 부여)
+      const exportedName = await exportToFolder(
+        parentDirHandle,
+        state.projectData.files,
+        modifiedDraftInfo,
+        state.projectData.projectName,
+        langLabel
+      );
+      state.exportedFolders[lang] = exportedName;
+
+      completed++;
+      const progressEl = document.getElementById('progress-fill');
+      if (progressEl) progressEl.style.width = `${(completed / totalLangs) * 100}%`;
+    }
+
+    state.downloadReady = true;
+    state.converting = false;
+    logger.info(CATEGORIES.CONVERT, `전체 내보내기 완료: ${Object.values(state.exportedFolders).join(', ')}`);
+    render();
+  } catch (e) {
+    state.converting = false;
+    logger.error(CATEGORIES.CONVERT, `내보내기 실패: ${e.message}`, { stack: e.stack });
+    alert(`내보내기 실패: ${e.message}\n\n로그를 다운로드해서 확인해주세요.`);
     render();
   }
 }
