@@ -3,8 +3,12 @@
  *
  * 매칭 전략:
  * 1. 기본: 순서 기반 1:1 매칭
- * 2. 검증: 영어 텍스트 비교 (캡컷 영어줄 vs 시트 영어 컬럼)
+ * 2. 검증: 소스 텍스트 비교 (영어 or 한국어 컬럼)
  * 3. 불일치 시 mismatch 표시 → UI에서 수동 수정 가능
+ *
+ * 프로젝트 유형별 매칭 기준:
+ * - english_only / paired: 캡컷 영어 ↔ 시트 영어 컬럼
+ * - korean_only: 캡컷 한국어 ↔ 시트 한국어 컬럼
  */
 
 import { logger, CATEGORIES } from './logger.js';
@@ -13,60 +17,76 @@ import { logger, CATEGORIES } from './logger.js';
  * 자막과 시트 데이터 매칭
  * @param {Array} subtitles - parseProject()에서 추출한 자막 배열
  * @param {Array} sheetRows - fetchSheetData()에서 추출한 행 배열
- * @param {object|null} title - 타이틀 텍스트 (있으면)
+ * @param {Array} titles - 타이틀 배열 (복수 가능)
  * @param {string} targetLang - 'cn' | 'jp'
+ * @param {boolean} isKoreanOnly - 한국어 전용 프로젝트 여부
  * @returns {Array<MatchResult>}
  */
-export function matchSubtitles(subtitles, sheetRows, title, targetLang) {
-  logger.info(CATEGORIES.MATCH, `매칭 시작: 자막 ${subtitles.length}개, 시트 ${sheetRows.length}행, 타겟: ${targetLang}`);
+export function matchSubtitles(subtitles, sheetRows, titles, targetLang, isKoreanOnly = false) {
+  logger.info(CATEGORIES.MATCH, `매칭 시작: 자막 ${subtitles.length}개, 타이틀 ${titles.length}개, 시트 ${sheetRows.length}행, 타겟: ${targetLang}, 한국어전용: ${isKoreanOnly}`);
 
   const results = [];
 
-  // 시트에서 타이틀 행 분리 (number가 '0'이거나 영어가 비어있는 첫 행)
-  let titleRow = null;
-  let subtitleRows = sheetRows;
+  // ── 시트에서 타이틀 행 분리 ──
+  // 시트 앞부분에서 number='0' 또는 빈 행을 타이틀 행으로 수집
+  const titleRows = [];
+  let subtitleStartIndex = 0;
 
-  if (sheetRows.length > 0 && (sheetRows[0].number === '0' || sheetRows[0].english === '')) {
-    titleRow = sheetRows[0];
-    subtitleRows = sheetRows.slice(1);
-    logger.info(CATEGORIES.MATCH, `타이틀 행 분리: "${titleRow.korean.slice(0, 30)}..."`);
+  for (let i = 0; i < sheetRows.length; i++) {
+    const row = sheetRows[i];
+    if (row.number === '0' || row.number === '') {
+      titleRows.push(row);
+      subtitleStartIndex = i + 1;
+    } else {
+      break; // 연속된 타이틀 행만 수집
+    }
+  }
+  const subtitleRows = sheetRows.slice(subtitleStartIndex);
+
+  if (titleRows.length > 0) {
+    logger.info(CATEGORIES.MATCH, `타이틀 행 ${titleRows.length}개 분리`);
   }
 
-  // 타이틀 매칭
-  if (title && titleRow) {
-    const targetText = targetLang === 'cn' ? titleRow.chinese : titleRow.japanese;
-    results.push({
-      type: 'title',
-      index: -1,
-      materialId: title.materialId,
-      capcutText: title.fullText,
-      capcutEnglish: title.englishLine,
-      capcutTranslation: title.translationLine,
-      sheetEnglish: titleRow.english,
-      sheetKorean: titleRow.korean,
-      sheetTarget: targetText,
-      status: targetText ? 'matched' : 'missing_translation',
-      confidence: 1.0,
-      sheetRowIndex: 0,
-    });
-  } else if (title) {
-    results.push({
-      type: 'title',
-      index: -1,
-      materialId: title.materialId,
-      capcutText: title.fullText,
-      capcutEnglish: title.englishLine,
-      capcutTranslation: title.translationLine,
-      sheetEnglish: '',
-      sheetKorean: '',
-      sheetTarget: '',
-      status: 'missing_sheet',
-      confidence: 0,
-      sheetRowIndex: -1,
-    });
+  // ── 타이틀 매칭 (복수 지원) ──
+  for (let i = 0; i < titles.length; i++) {
+    const title = titles[i];
+    const titleRow = titleRows[i] || null;
+
+    if (titleRow) {
+      const targetText = targetLang === 'cn' ? titleRow.chinese : titleRow.japanese;
+      results.push({
+        type: 'title',
+        index: i,
+        materialId: title.materialId,
+        capcutText: title.fullText,
+        capcutEnglish: title.englishLine,
+        capcutTranslation: title.translationLine,
+        sheetEnglish: titleRow.english,
+        sheetKorean: titleRow.korean,
+        sheetTarget: targetText,
+        status: targetText ? 'matched' : 'missing_translation',
+        confidence: 1.0,
+        sheetRowIndex: i,
+      });
+    } else {
+      results.push({
+        type: 'title',
+        index: i,
+        materialId: title.materialId,
+        capcutText: title.fullText,
+        capcutEnglish: title.englishLine,
+        capcutTranslation: title.translationLine,
+        sheetEnglish: '',
+        sheetKorean: '',
+        sheetTarget: '',
+        status: 'missing_sheet',
+        confidence: 0,
+        sheetRowIndex: -1,
+      });
+    }
   }
 
-  // 자막 순서 매칭
+  // ── 자막 순서 매칭 ──
   for (let i = 0; i < Math.max(subtitles.length, subtitleRows.length); i++) {
     const sub = subtitles[i] || null;
     const row = subtitleRows[i] || null;
@@ -74,15 +94,17 @@ export function matchSubtitles(subtitles, sheetRows, title, targetLang) {
     if (sub && row) {
       const targetText = targetLang === 'cn' ? row.chinese : row.japanese;
 
-      // 영어 텍스트로 검증
-      const confidence = calculateConfidence(sub.englishLine, row.english);
+      // 소스 텍스트 비교: 한국어 전용이면 한국어 컬럼, 아니면 영어 컬럼
+      const capcutSource = isKoreanOnly ? sub.translationLine : sub.englishLine;
+      const sheetSource = isKoreanOnly ? row.korean : row.english;
+      const confidence = calculateConfidence(capcutSource, sheetSource);
       const status = getMatchStatus(confidence, targetText);
 
       results.push({
         type: 'subtitle',
         index: i,
         materialId: sub.materialId,
-        capcutText: sub.fullText,
+        capcutText: isKoreanOnly ? sub.translationLine : (sub.englishLine || sub.translationLine),
         capcutEnglish: sub.englishLine,
         capcutTranslation: sub.translationLine,
         sheetEnglish: row.english,
@@ -90,14 +112,14 @@ export function matchSubtitles(subtitles, sheetRows, title, targetLang) {
         sheetTarget: targetText,
         status,
         confidence,
-        sheetRowIndex: i + (titleRow ? 1 : 0),
+        sheetRowIndex: i + titleRows.length,
       });
     } else if (sub && !row) {
       results.push({
         type: 'subtitle',
         index: i,
         materialId: sub.materialId,
-        capcutText: sub.fullText,
+        capcutText: isKoreanOnly ? sub.translationLine : (sub.englishLine || sub.translationLine),
         capcutEnglish: sub.englishLine,
         capcutTranslation: sub.translationLine,
         sheetEnglish: '',
@@ -121,7 +143,7 @@ export function matchSubtitles(subtitles, sheetRows, title, targetLang) {
         sheetTarget: targetText,
         status: 'missing_capcut',
         confidence: 0,
-        sheetRowIndex: i + (titleRow ? 1 : 0),
+        sheetRowIndex: i + titleRows.length,
       });
     }
   }
@@ -141,14 +163,14 @@ export function matchSubtitles(subtitles, sheetRows, title, targetLang) {
 }
 
 /**
- * 영어 텍스트 유사도 계산 (0~1)
- * 완전 일치: 1.0, 부분 일치: 0~1, 불일치: 0
+ * 텍스트 유사도 계산 (0~1)
+ * 영어/한국어 모두 사용 가능
  */
-function calculateConfidence(capcutEn, sheetEn) {
-  if (!capcutEn || !sheetEn) return 0;
+function calculateConfidence(capcutText, sheetText) {
+  if (!capcutText || !sheetText) return 0;
 
-  const a = normalize(capcutEn);
-  const b = normalize(sheetEn);
+  const a = normalize(capcutText);
+  const b = normalize(sheetText);
 
   if (a === b) return 1.0;
 
@@ -183,18 +205,11 @@ function normalize(text) {
 function getMatchStatus(confidence, targetText) {
   if (!targetText) return 'missing_translation';
   if (confidence >= 0.7) return 'matched';
-  if (confidence >= 0.3) return 'mismatch';
   return 'mismatch';
 }
 
 /**
  * 매칭 결과를 수동으로 수정 (UI에서 호출)
- * @param {Array} results - 기존 매칭 결과
- * @param {number} resultIndex - 수정할 항목 인덱스
- * @param {number} newSheetRowIndex - 새로 매칭할 시트 행 인덱스
- * @param {Array} sheetRows - 전체 시트 행
- * @param {string} targetLang - 'cn' | 'jp'
- * @returns {Array} 수정된 매칭 결과
  */
 export function rematchRow(results, resultIndex, newSheetRowIndex, sheetRows, targetLang) {
   const result = results[resultIndex];
@@ -211,12 +226,11 @@ export function rematchRow(results, resultIndex, newSheetRowIndex, sheetRows, ta
     sheetKorean: row.korean,
     sheetTarget: targetText,
     status: targetText ? 'matched' : 'missing_translation',
-    confidence: calculateConfidence(result.capcutEnglish, row.english),
+    confidence: calculateConfidence(result.capcutEnglish || result.capcutTranslation, row.english || row.korean),
     sheetRowIndex: newSheetRowIndex,
   };
 
   logger.info(CATEGORIES.MATCH, `수동 매칭 변경: [${resultIndex}] → 시트 행 ${newSheetRowIndex}`, {
-    english: row.english,
     target: targetText,
   });
 

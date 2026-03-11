@@ -47,29 +47,42 @@ export function parseProject(draftInfo) {
   // ── 트랙 분류 ──
   const classified = classifyTracks(textTracks, texts, videoDuration);
 
-  // ── 자막 빌드 ──
-  const isEnglishOnly = !classified.translationTrack;
+  // ── 프로젝트 유형 판별 ──
+  const hasEnglish = !!classified.englishTrack;
+  const hasTranslation = !!classified.translationTrack;
   let subtitles;
+  let projectType;
 
-  if (isEnglishOnly) {
-    // EN-only: 영어 트랙의 세그먼트만
-    subtitles = buildEnglishOnlySubtitles(classified.englishTrack, texts);
-  } else {
-    // KR 등 다국어: 영어 + 번역 트랙을 시간으로 매칭
+  if (hasEnglish && hasTranslation) {
+    // 영어 + 번역 둘 다 있음 → 번역 트랙을 교체 대상으로
+    projectType = 'paired';
     subtitles = buildPairedSubtitles(classified.englishTrack, classified.translationTrack, texts);
+  } else if (hasEnglish && !hasTranslation) {
+    // 영어만 있음 → 번역을 추가(append)
+    projectType = 'english_only';
+    subtitles = buildEnglishOnlySubtitles(classified.englishTrack, texts);
+  } else if (!hasEnglish && hasTranslation) {
+    // 한국어(비영어)만 있음 → 전체 교체
+    projectType = 'korean_only';
+    subtitles = buildKoreanOnlySubtitles(classified.translationTrack, texts);
+  } else {
+    projectType = 'unknown';
+    subtitles = [];
+    logger.warn(CATEGORIES.PARSE, '자막 트랙을 분류할 수 없습니다');
   }
 
-  // ── 타이틀 빌드 ──
-  const title = classified.titleTrack
-    ? buildTitle(classified.titleTrack, texts)
-    : null;
+  // ── 타이틀 빌드 (복수 지원) ──
+  const titles = classified.titleTracks.map(t => buildTitle(t, texts)).filter(Boolean);
 
-  logger.info(CATEGORIES.PARSE, `파싱 완료: 자막 ${subtitles.length}개, 타이틀 ${title ? 1 : 0}개, EN-only: ${isEnglishOnly}`);
+  logger.info(CATEGORIES.PARSE, `파싱 완료: 자막 ${subtitles.length}개, 타이틀 ${titles.length}개, 유형: ${projectType}`);
 
   return {
     subtitles,
-    title,
-    isEnglishOnly,
+    titles,
+    title: titles[0] || null, // 하위 호환
+    projectType,
+    isEnglishOnly: projectType === 'english_only',
+    isKoreanOnly: projectType === 'korean_only',
     metadata: {
       version: draftInfo.new_version,
       duration: draftInfo.duration,
@@ -91,24 +104,24 @@ export function parseProject(draftInfo) {
  * - 나머지 다중 세그먼트 비영어 → 번역 트랙
  */
 function classifyTracks(textTracks, texts, videoDuration) {
+  const titleTracks = [];
   let englishTrack = null;
   let translationTrack = null;
-  let titleTrack = null;
 
   for (const track of textTracks) {
     const segments = track.segments || [];
     if (segments.length === 0) continue;
 
-    // 타이틀 판별: 세그먼트 1개 + 영상 길이 80% 이상 + 비영어
+    // 타이틀 판별: 세그먼트 1개 + 영상 길이 70% 이상
     if (segments.length === 1 && videoDuration > 0) {
       const seg = segments[0];
       const segDuration = seg.target_timerange?.duration || 0;
       const ratio = segDuration / videoDuration;
-      const material = texts.find(t => t.id === seg.material_id);
-      const sampleText = extractTextFromMaterial(material);
 
-      if (ratio >= 0.8 && !isPrimarilyEnglish(sampleText)) {
-        titleTrack = track;
+      if (ratio >= 0.7) {
+        const material = texts.find(t => t.id === seg.material_id);
+        const sampleText = extractTextFromMaterial(material);
+        titleTracks.push(track);
         logger.info(CATEGORIES.PARSE, `타이틀 트랙 감지 (비율: ${(ratio * 100).toFixed(0)}%)`, {
           text: sampleText.slice(0, 60),
         });
@@ -124,25 +137,18 @@ function classifyTracks(textTracks, texts, videoDuration) {
       englishTrack = track;
       logger.info(CATEGORIES.PARSE, `영어 트랙 감지 (세그먼트 ${segments.length}개)`);
     } else {
-      // 다중 세그먼트 비영어 → 번역 트랙
-      if (segments.length > 1) {
-        translationTrack = track;
-        logger.info(CATEGORIES.PARSE, `번역 트랙 감지 (세그먼트 ${segments.length}개)`);
-      } else if (!titleTrack) {
-        // 세그먼트 1개인데 타이틀 조건 안 맞으면 번역으로
-        translationTrack = track;
-        logger.info(CATEGORIES.PARSE, '번역 트랙 감지 (세그먼트 1개, 타이틀 아님)');
-      }
+      translationTrack = track;
+      logger.info(CATEGORIES.PARSE, `번역 트랙 감지 (세그먼트 ${segments.length}개)`);
     }
   }
 
-  // 영어 트랙이 없지만 트랙이 1개면 그것이 영어 트랙 (EN-only)
-  if (!englishTrack && textTracks.length === 1 && !titleTrack) {
-    englishTrack = textTracks[0];
-    logger.info(CATEGORIES.PARSE, '텍스트 트랙 1개 → EN-only로 처리');
+  // 타이틀 아닌 트랙이 1개뿐이고 영어로 판별 안 된 경우 → 내용으로 재확인
+  if (!englishTrack && translationTrack && !titleTracks.length) {
+    // 비영어 트랙 1개만 있으면 그게 유일한 자막 트랙 (한국어 전용 등)
+    logger.info(CATEGORIES.PARSE, '영어 트랙 없음 → 비영어 전용 프로젝트');
   }
 
-  return { englishTrack, translationTrack, titleTrack };
+  return { englishTrack, translationTrack, titleTracks };
 }
 
 /**
@@ -207,6 +213,45 @@ function buildEnglishOnlySubtitles(englishTrack, texts) {
       timeRange: seg.target_timerange,
       rawMaterial: material,
       rawEnglishMaterial: material,
+      content: parsed.content,
+      styles: parsed.styles,
+      words: parsed.words,
+    });
+  }
+
+  return subtitles;
+}
+
+/**
+ * 한국어 전용: 번역 트랙만으로 자막 배열 생성
+ * → materialId = 한국어 material (전체 교체 대상)
+ */
+function buildKoreanOnlySubtitles(koreanTrack, texts) {
+  if (!koreanTrack) return [];
+
+  const segments = sortSegmentsByTime(koreanTrack.segments || []);
+  const subtitles = [];
+
+  for (const seg of segments) {
+    const material = texts.find(t => t.id === seg.material_id);
+    if (!material) {
+      logger.warn(CATEGORIES.PARSE, `한국어 세그먼트의 material 없음: ${seg.material_id}`);
+      continue;
+    }
+
+    const parsed = parseMaterialContent(material);
+
+    subtitles.push({
+      index: subtitles.length,
+      englishLine: '',
+      translationLine: parsed.text,
+      englishMaterialId: null,
+      translationMaterialId: material.id,
+      materialId: material.id,
+      segmentId: seg.id,
+      timeRange: seg.target_timerange,
+      rawMaterial: material,
+      rawEnglishMaterial: null,
       content: parsed.content,
       styles: parsed.styles,
       words: parsed.words,
@@ -564,7 +609,7 @@ function applyStyleConfig(style, styleConfig) {
   if (styleConfig.strokeColor && style.strokes?.[0]?.content?.solid) {
     style.strokes[0].content.solid.color = styleConfig.strokeColor;
   }
-  if (styleConfig.strokeWidth && style.strokes?.[0]) {
+  if (styleConfig.strokeWidth !== undefined && style.strokes?.[0]) {
     style.strokes[0].width = styleConfig.strokeWidth;
   }
   if (styleConfig.fontSize) {

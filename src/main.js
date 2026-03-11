@@ -120,10 +120,14 @@ function renderStepContent() {
 function renderStep1() {
   const info = state.parsedProject
     ? `<div class="summary">
-        <div class="summary-row"><span>프로젝트명</span><span>${state.projectData.projectName}</span></div>
+        <div class="summary-row"><span>프로젝트명</span><span>${escHtml(state.projectData.projectName)}</span></div>
         <div class="summary-row"><span>자막 수</span><span>${state.parsedProject.subtitles.length}개</span></div>
-        <div class="summary-row"><span>타이틀</span><span>${state.parsedProject.title ? '있음' : '없음'}</span></div>
-        <div class="summary-row"><span>프로젝트 유형</span><span>${state.parsedProject.isEnglishOnly ? '영어 전용' : '영어 + 번역'}</span></div>
+        <div class="summary-row"><span>타이틀</span><span>${state.parsedProject.titles.length > 0 ? state.parsedProject.titles.length + '개' : '없음'}</span></div>
+        <div class="summary-row"><span>프로젝트 유형</span><span>${
+          state.parsedProject.projectType === 'english_only' ? '영어 전용' :
+          state.parsedProject.projectType === 'korean_only' ? '한국어 전용' :
+          state.parsedProject.projectType === 'paired' ? '영어 + 번역' : '알 수 없음'
+        }</span></div>
         <div class="summary-row"><span>총 길이</span><span>${(state.parsedProject.metadata.duration / 1000000).toFixed(1)}초</span></div>
        </div>`
     : '';
@@ -182,6 +186,12 @@ async function handleProjectUpload(input) {
   try {
     state.projectData = await extractProject(input);
     state.parsedProject = parseProject(state.projectData.draftInfo);
+
+    // 이전 매칭/변환 결과 초기화 (파일 교체 시 stale 데이터 방지)
+    state.matchResultsByLang = {};
+    state.resultBlobs = {};
+    state.downloadReady = false;
+    state.converting = false;
 
     // 자막 요약 로그
     const summary = summarizeSubtitles(state.parsedProject.subtitles);
@@ -392,7 +402,7 @@ function renderStep3() {
   const firstSub = state.parsedProject?.subtitles?.[0];
   const origFontPath = firstSub?.rawMaterial?.font_path || '';
   const origFontId = firstSub?.rawMaterial?.font_id || '';
-  const hasTitle = !!state.parsedProject?.title;
+  const hasTitle = (state.parsedProject?.titles?.length || 0) > 0;
 
   const langOptions = [
     { code: 'cn', label: '中文 (중국어)' },
@@ -508,8 +518,9 @@ function bindStep3() {
       state.matchResultsByLang[lang] = matchSubtitles(
         state.parsedProject.subtitles,
         state.sheetData.rows,
-        state.parsedProject.title,
-        lang
+        state.parsedProject.titles || [],
+        lang,
+        state.parsedProject.isKoreanOnly
       );
     }
 
@@ -588,6 +599,8 @@ function saveCurrentSettings() {
 // Step 4: 매칭 미리보기 (언어별 섹션)
 // =============================================
 function renderStep4() {
+  const isKoreanOnly = state.parsedProject?.isKoreanOnly;
+
   const sections = state.targetLangs.map(lang => {
     const results = state.matchResultsByLang[lang] || [];
     const langLabel = lang === 'cn' ? '중국어' : '일본어';
@@ -607,16 +620,23 @@ function renderStep4() {
         : r.status === 'missing_capcut' ? '캡컷 없음'
         : '번역 없음';
 
+      // 한국어 전용: 소스 컬럼은 한국어
+      const sourceText = isKoreanOnly ? r.capcutTranslation : r.capcutEnglish;
+      const subText = isKoreanOnly ? '' : r.capcutTranslation;
+
       return `
         <tr>
-          <td>${r.type === 'title' ? 'T' : r.index + 1}</td>
-          <td title="${escHtml(r.capcutEnglish)}">${escHtml(truncate(r.capcutEnglish, 35))}</td>
-          <td title="${escHtml(r.capcutTranslation)}">${escHtml(truncate(r.capcutTranslation, 25))}</td>
+          <td>${r.type === 'title' ? 'T' + (r.index + 1) : r.index + 1}</td>
+          <td title="${escHtml(sourceText)}">${escHtml(truncate(sourceText, 35))}</td>
+          ${isKoreanOnly ? '' : `<td title="${escHtml(subText)}">${escHtml(truncate(subText, 25))}</td>`}
           <td title="${escHtml(r.sheetTarget)}">${escHtml(truncate(r.sheetTarget, 30))}</td>
           <td><span class="badge ${badgeCls}">${statusLabel}</span></td>
         </tr>
       `;
     }).join('');
+
+    // 한국어 전용이면 2열, 아니면 3열
+    const sourceHeader = isKoreanOnly ? '캡컷 한국어' : '캡컷 영어';
 
     return `
       <div style="margin-bottom:24px;">
@@ -631,8 +651,8 @@ function renderStep4() {
             <thead>
               <tr>
                 <th>#</th>
-                <th>캡컷 영어</th>
-                <th>캡컷 번역</th>
+                <th>${sourceHeader}</th>
+                ${isKoreanOnly ? '' : '<th>캡컷 번역</th>'}
                 <th>시트 ${langLabel}</th>
                 <th>상태</th>
               </tr>
